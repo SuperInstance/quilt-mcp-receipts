@@ -8,7 +8,7 @@
 // NOT imported from server.mjs — so conformance verifies the spec, not the
 // implementation against itself.
 
-import { createHash, createHmac } from 'node:crypto';
+import { createHash, createHmac, sign as cryptoSign } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { McpClient } from './mcp-client.mjs';
@@ -33,8 +33,8 @@ function fnv1a64(str) {
 
 export const SELF_SECRET = 'conformance-self-secret-67b';
 
-export function makeServerAdapter({ qmr2 = true } = {}) {
-  const client = new McpClient({ demo: false, qmr2, env: { MCP_RECEIPT_SECRET: SELF_SECRET } });
+export function makeServerAdapter({ qmr2 = true, v3 = false } = {}) {
+  const client = new McpClient({ demo: false, qmr2, v3, env: { MCP_RECEIPT_SECRET: SELF_SECRET } });
   let handshaken = false;
 
   async function ensureHandshake() {
@@ -52,8 +52,8 @@ export function makeServerAdapter({ qmr2 = true } = {}) {
   }
 
   const adapter = {
-    name: `quilt-mcp-receipts server (stdio MCP, qmr2=${qmr2 ? 'on' : 'off'})`,
-    features: { dialects: true },
+    name: `quilt-mcp-receipts server (stdio MCP, qmr2=${qmr2 ? 'on' : 'off'}, v3=${v3 ? 'on' : 'off'})`,
+    features: { dialects: true, v3 },
     store: () => client.store, // where this adapter's chain lives (dogfood copies it out)
 
     async reset() {
@@ -64,24 +64,44 @@ export function makeServerAdapter({ qmr2 = true } = {}) {
     },
 
     makeReceipt(seq, prev, body, opts = {}) {
-      const secret = opts.secret ?? SELF_SECRET;
       const dialectName = opts.dialect ?? 'sha256-custody';
       const id = dialectId(dialectName, seq, prev, body);
-      const sig = createHmac('sha256', secret).update(`qmr1:sig:${id}`).digest('hex');
+      // v3 sig slot (docs/qmr2-design.md §8): sigAlg "ed25519" — sig =
+      // Ed25519("qmr1:sig:"+id) under the signer's private key, the row NAMES
+      // the signer by fingerprint. opts.signWith mints the sig with a DIFFERENT
+      // private key than the claimed fingerprint — the impostor path the
+      // harness's v3-wrong-key case must be able to express THROUGH this
+      // signing law (a well-formed row that fails VERIFICATION, not construction).
+      if (opts.sigAlg === 'ed25519') {
+        const signer = opts.signer;
+        if (!signer || !signer.privateKeyPem || !signer.fp) {
+          throw new Error('adapter makeReceipt: sigAlg ed25519 needs opts.signer {privateKeyPem, fp}');
+        }
+        const signingKey = opts.signWith ?? signer.privateKeyPem;
+        const sig = cryptoSign(null, Buffer.from(`qmr1:sig:${id}`, 'utf8'), signingKey).toString('hex');
+        const receipt = { seq, prev, body, id, sig, sigAlg: 'ed25519', sigKeyFp: signer.fp };
+        if (opts.dialect !== undefined) receipt.dialect = opts.dialect;
+        return receipt;
+      }
+      const sig = createHmac('sha256', opts.secret ?? SELF_SECRET).update(`qmr1:sig:${id}`).digest('hex');
       const receipt = { seq, prev, body, id, sig };
       if (opts.dialect !== undefined) receipt.dialect = opts.dialect;
       return receipt;
     },
 
-    async appendRaw(receipt) {
+    async appendRaw(receipt, opts = {}) {
       await ensureHandshake();
-      const res = await client.callTool('append_receipt', { receipt });
+      const args = { receipt };
+      if (opts.keyring !== undefined) args.keyring = opts.keyring; // v3: prove the signer at the door
+      const res = await client.callTool('append_receipt', args);
       return res.payload; // {ok:true,…} | {ok:false,error,…}
     },
 
     async verify(opts = {}) {
       await ensureHandshake();
-      const args = opts.dialect_mode ? { dialect_mode: opts.dialect_mode } : {};
+      const args = {};
+      if (opts.dialect_mode) args.dialect_mode = opts.dialect_mode;
+      if (opts.keyring !== undefined) args.keyring = opts.keyring; // v3: the per-verify trust root
       const res = await client.callTool('verify_chain', args);
       return res.payload;
     },
@@ -100,6 +120,14 @@ export function makeServerAdapter({ qmr2 = true } = {}) {
 
     async rewrite(rows) {
       client.writeLines(rows.map((r) => JSON.stringify(r)));
+    },
+
+    // The versioned tool surface, as the host itself reports it (the harness's
+    // v3-tool-gating case asserts verify_attribution is listed iff features.v3).
+    async listTools() {
+      await ensureHandshake();
+      const res = await client.request('tools/list', {});
+      return res.tools.map((t) => t.name);
     },
 
     async stop() {

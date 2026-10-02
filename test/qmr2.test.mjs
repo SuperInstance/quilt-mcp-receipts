@@ -321,27 +321,35 @@ test('upgrade_chain bad args: to_seq beyond chain length → E_BAD_ARGS', async 
 });
 
 // ---- F. the harness's first customer: itself ---------------------------------
-test('conformance self-application: runConformance(server adapter) — the harness verifies its own host, all cases green', async () => {
-  const adapter = makeServerAdapter({ qmr2: true });
+test('conformance self-application: runConformance(server adapter) — the harness verifies its own host, all 16 named cases green (incl. the §9 v3 sig cases)', async () => {
+  const adapter = makeServerAdapter({ qmr2: true, v3: true });
   try {
     const verdict = await runConformance(adapter);
     assert.equal(verdict.ok, true, JSON.stringify(verdict, null, 2));
     assert.deepEqual(verdict.skipped, []);
     const names = verdict.cases.map((x) => x.name).sort();
-    assert.deepEqual(names, ['body-flip', 'clean-chain', 'custody-law', 'determinism', 'empty-body', 'replay', 'row-deletion', 'sig-flip', 'unknown-dialect', 'wrong-secret']);
+    assert.deepEqual(names, [
+      'body-flip', 'clean-chain', 'custody-law', 'determinism', 'empty-body',
+      'replay', 'row-deletion', 'sig-flip', 'unknown-dialect', 'v3-clean',
+      'v3-forged-sig', 'v3-qmr1-shape', 'v3-tool-gating', 'v3-unknown-signer',
+      'v3-wrong-key', 'wrong-secret',
+    ]);
   } finally {
     await adapter.stop();
   }
 });
 
-test('conformance adapter honors the dialect feature flag: dialects=false skips dialect cases, marks them visibly', async () => {
-  const adapter = makeServerAdapter({ qmr2: false });
-  adapter.features = { dialects: false };
+test('conformance adapter honors the feature flags: dialects=false and v3=false skip their cases, marked visibly; the tool-gating surface probe still runs', async () => {
+  const adapter = makeServerAdapter({ qmr2: false, v3: false });
+  adapter.features = { dialects: false, v3: false };
   try {
     const verdict = await runConformance(adapter);
     assert.equal(verdict.ok, true, JSON.stringify(verdict, null, 2));
-    assert.deepEqual(verdict.skipped, ['unknown-dialect', 'custody-law']);
-    assert.equal(verdict.cases.length, 8);
+    assert.deepEqual(verdict.skipped,
+      ['unknown-dialect', 'custody-law', 'v3-clean', 'v3-wrong-key', 'v3-unknown-signer', 'v3-forged-sig', 'v3-qmr1-shape']);
+    assert.equal(verdict.cases.length, 9); // 8 base + v3-tool-gating (surface probes don't need the sig gate)
+    const gating = verdict.cases.find((c) => c.name === 'v3-tool-gating');
+    assert.equal(gating.ok, true, 'the server lists verify_attribution ONLY under --v3');
   } finally {
     await adapter.stop();
   }

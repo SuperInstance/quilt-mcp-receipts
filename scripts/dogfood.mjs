@@ -29,7 +29,9 @@ const GENESIS_PREV = '0'.repeat(64);
 const ts = () => new Date().toISOString();
 
 const main = async () => {
-  const adapter = makeServerAdapter({ qmr2: true });
+  // v3: true — the receipted self-application carries the FULL named law
+  // (16 cases incl. the §9 Ed25519 sig cases), not the v3-skipped subset.
+  const adapter = makeServerAdapter({ qmr2: true, v3: true });
   const out = { steps: [] };
   try {
     // -- 1. conformance self-application -------------------------------------
@@ -69,7 +71,7 @@ const main = async () => {
       kind: 'conformance.harness.run',
       ts: ts(),
       harness: 'test/conformance.mjs (runConformance)',
-      adapter: 'test/adapter-self.mjs (stdio MCP → quilt-mcp-receipts server, qmr2 on)',
+      adapter: 'test/adapter-self.mjs (stdio MCP → quilt-mcp-receipts server, qmr2+v3 on)',
       ok: verdict.ok,
       cases: verdict.cases.length,
       failed: 0,

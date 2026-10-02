@@ -289,3 +289,12 @@ fingerprints at once; no re-signing or migration of existing rows (qmr1 rows
 are final bytes). The organ-side twin (checkpoint signatures, key ERAS through
 rotation chains, `signCheckpointEd25519`) lives in quilt-jev-toolkit
 REVERSE-ACTUALIZED-SPEC §10 — the fingerprint law is the shared seam.
+
+Revocation DESIGN (wave-69, lane 69-b) now lives in the organ-side twin:
+REVERSE-ACTUALIZED-SPEC §11 splits it honestly — the ENFORCEMENT half is live
+there (a verifier holding a revocation map refuses eras anchored after a key's
+closure with `E_KEY_REVOKED`), and the signed-statement layer stays parked by
+design. The qmr2 rows themselves stay revocation-free by this section's law:
+row bytes are final, and a revoked key's rows refuse exactly as any other
+unproven signer's — drop the fingerprint from the verify-time keyring and
+`E_UNKNOWN_SIGNER` already says everything qmr2 needs to say.

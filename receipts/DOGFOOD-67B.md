@@ -6,7 +6,7 @@ Run: `node scripts/dogfood.mjs` (re-runnable; each run rewrites this receipt set
 
 1. **Conformance self-application** — `test/conformance.mjs` (`runConformance`)
    against the live qmr2 server over stdio MCP via `test/adapter-self.mjs`:
-   **10/10 cases pass** (clean-chain, body-flip, sig-flip, row-deletion, replay, wrong-secret, unknown-dialect, empty-body, custody-law, determinism); skipped: none.
+   **16/16 cases pass** (clean-chain, body-flip, sig-flip, row-deletion, replay, wrong-secret, unknown-dialect, empty-body, custody-law, determinism, v3-clean, v3-wrong-key, v3-unknown-signer, v3-forged-sig, v3-qmr1-shape, v3-tool-gating); skipped: none.
 2. **First external producer** — `fleet-seeds/tools/wal-conformance.mjs` (real
    tool, read-only, offline) ran green (`ok: true`, chains: qthe, pong, toyStone)
    and its verdict was appended THROUGH the harness adapter API as a
@@ -15,13 +15,13 @@ Run: `node scripts/dogfood.mjs` (re-runnable; each run rewrites this receipt set
 
 ## The receipt set
 
-- File: `receipts/dogfood-67b.jsonl` — 3 receipts, sha256 dce7bc1a022a1590a2c3fb8e4669091956ceef5c38fc04d7831b1d4ded7eb2f3
-- Tip: `edad077f542cb265a39132b5a51fb0e0ee6d237dfdac5d4aeab59428bfac6d4b`
+- File: `receipts/dogfood-67b.jsonl` — 3 receipts, sha256 a982b30801280253ed8d044a1a77038738ca5f78e39e36a929bf7212522710ec
+- Tip: `afbc460a4664123e3798b7fcc73f57ab21eb4b84677ecd06291da6a85b11b651`
 - verify (any mode): ok · verify (dialect_mode "custody"): ok — the set is a lawful custody chain.
 - Re-derive independently: `node server.mjs --store receipts/dogfood-67b.jsonl`
   then call `verify_chain` over stdio MCP.
 
 ## Receipt index
 
-- seq 2 `conformance.harness.run` — id `afe542ca20122173…`
-- seq 3 `wal.conformance.run` — id `edad077f542cb265…`
+- seq 2 `conformance.harness.run` — id `47c4a0b94a2fa952…`
+- seq 3 `wal.conformance.run` — id `afbc460a4664123e…`

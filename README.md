@@ -78,26 +78,47 @@ distill: **one receipt primitive, pluggable hash, one law.** Spec:
 `test/conformance.mjs` is the shared battery: tamper trio (body flip →
 `E_HASH_MISMATCH` at_seq · sig flip → `E_BAD_SIGNATURE` · row deletion →
 `E_SEQ_MISMATCH`), replay, wrong-secret, unknown-dialect, empty-body,
-custody-law, determinism, plus a clean-chain positive control. Copy it into
-your repo verbatim (it is dependency-free), write a ~40-line adapter, run:
+custody-law, determinism, plus a clean-chain positive control — and, since the
+§9 wave, the **v3 sig cases** (Ed25519 attribution, docs/qmr2-design.md §8):
+`v3-clean` (Ed25519 row appends + verifies under its keyring — the control),
+`v3-wrong-key` (sig minted by an impostor's key while the row names the honest
+fingerprint → `E_BAD_SIGNATURE` at the door), `v3-unknown-signer` (keyring
+missing that fingerprint, or absent → `E_UNKNOWN_SIGNER`), `v3-forged-sig`
+(sig flipped behind the API → `E_BAD_SIGNATURE` at_seq), `v3-qmr1-shape` (the
+five-field qmr1 row is byte-unchanged; keyring does not disturb hmac rows),
+and `v3-tool-gating` (the base trio is listed always, `verify_attribution` iff
+the v3 gate is open). Copy it into your repo verbatim (it is dependency-free),
+write a ~40-line adapter, run:
 
 ```js
 import { runConformance } from './conformance.mjs';
 
 const verdict = await runConformance({
   name: 'my-repo-receipt-chain',
-  features: { dialects: true },          // false → dialect cases are marked skipped, not failed
+  features: { dialects: true, v3: true }, // false → that layer's cases are marked
+                                          // skipped, not failed (visible, honest);
+                                          // UNDECLARED = the full battery is attempted
   async reset() { /* fresh empty chain */ },
-  makeReceipt(seq, prev, body, { secret, dialect } = {}) { /* sign per your dialect → full receipt */ },
-  async appendRaw(receipt) { /* submit → {ok} | {ok:false, error, at_seq?, detail?} */ },
-  async verify(opts = {}) { /* full audit; opts.dialect_mode? → {ok} | {ok:false, error, at_seq?} */ },
+  makeReceipt(seq, prev, body, { secret, dialect, sigAlg, signer, signWith } = {}) {
+    /* sign per your dialect → full receipt; sigAlg:'ed25519' signs under
+       signer.privateKeyPem and names signer.fp (signWith = mint with a
+       DIFFERENT private key than the claimed fingerprint — the impostor path) */
+  },
+  async appendRaw(receipt, { keyring } = {}) { /* submit → {ok} | {ok:false, error, at_seq?, detail?} */ },
+  async verify(opts = {}) { /* full audit; opts.dialect_mode? / opts.keyring? → {ok} | {ok:false, error, at_seq?} */ },
   async readTip() { /* tip id | null */ },
   async rows() { /* raw rows (persistence-level read) */ },
   async rewrite(rows) { /* persistence-level rewrite — tampering happens behind the API's back */ },
+  async listTools() { /* optional: your host's tool names — enables v3-tool-gating */ },
   // errorMap: { yourLegacyName: 'E_HASH_MISMATCH' }  // optional bridge for legacy error names
 });
 assert.equal(verdict.ok, true);            // your chain now speaks the fleet's named fail-closed law
 ```
+
+The harness mints Ed25519 identities AT RUNTIME (`node:crypto`; test-time keys
+only, never committed) and never signs itself — signing is the adapter's law
+under test. The v3 named-law count grew 10 → 16; the self-application below
+proves all 16 against the real server.
 
 First customer: this harness's own host — `test/adapter-self.mjs` drives the
 real server over stdio MCP, and the run is receipted in
@@ -120,8 +141,10 @@ culture already exists — it just wasn't addressable over a wire. MCP-izing it
 ```sh
 node server.mjs --demo          # seed 5 sample receipts into ./store.jsonl, then serve
 node examples/client-demo.mjs   # end-to-end client drive: handshake → list → read → verify → append
-npm test                        # 30/30 tests — 15 untouched v1 + 15 qmr2 (dialect layer, custody law,
-                                #   upgrade determinism, conformance self-application)
+npm test                        # 37/37 test cases green — 15 v1 + 15 qmr2 (dialect layer,
+                                #   upgrade determinism, conformance self-application) + 7 v3
+                                #   (sig slot, keyring, verify_attribution); the node runner
+                                #   additionally counts the 3 helper modules as pass-throughs
 node scripts/dogfood.mjs        # re-run the dogfood: harness self-receipt + wal-* external producer
 ```
 

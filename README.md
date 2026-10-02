@@ -5,7 +5,8 @@ agent — inside or outside the account — can **read**, **verify**, and **appe
 fleet receipts through the Model Context Protocol, without cloning a repo and
 without being trusted by anything.
 
-Spike v1, dialect `qmr1`. Stdio JSON-RPC 2.0, **stdlib only, no SDK**.
+Spike v1, dialect `qmr1`; v0.2.0 adds the **qmr2 pluggable-hash layer** (below).
+Stdio JSON-RPC 2.0, **stdlib only, no SDK**.
 
 ## What
 
@@ -34,7 +35,74 @@ whole chain from genesis. Full spec + threat model: [DESIGN.md](DESIGN.md).
 
 Named error codes: `E_STORE_CORRUPT`, `E_MISSING_FIELD`, `E_UNKNOWN_FIELD`,
 `E_BODY_INVALID`, `E_SEQ_MISMATCH` (covers replay), `E_PREV_MISMATCH` (broken
-hash link), `E_HASH_MISMATCH`, `E_BAD_SIGNATURE`.
+hash link), `E_HASH_MISMATCH`, `E_BAD_SIGNATURE` — qmr2 adds `E_DIALECT_FORBIDDEN`
+and `E_UNKNOWN_DIALECT`.
+
+## qmr2 — the pluggable-hash dialect layer (v0.2.0)
+
+The wave-66 seed-dna census found the receipt chain re-implemented 12+ times
+across the fleet in TWO contradicting hash dialects — fnv1a-64 "canary" (fast)
+vs sha256 "custody" — with the tamper battery re-proven ~8×. qmr2 is the
+distill: **one receipt primitive, pluggable hash, one law.** Spec:
+[docs/qmr2-design.md](docs/qmr2-design.md).
+
+- **Same five fields.** A row MAY carry a sixth field `dialect`; qmr1 rows read
+  as `sha256-custody` and are never rewritten on disk (never-delete-data holds
+  for shape too).
+- **Portable preimage** — `"qmr1:" + seq + ":" + prev + ":" + canonicalJSON(body)`
+  is identical across dialects, so a chain can be **re-hash-upgraded** row-by-row.
+- **Registry:**
+
+  | dialect | hash | id form | custody |
+  |---|---|---|---|
+  | `sha256-custody` | SHA-256 | 64 hex | **yes** — qmr1-compatible |
+  | `fnv1a-canary` | FNV-1a 64 | `0x` + 16 hex | **no** — fast chains that will never hold custody |
+
+- **The one law:** custody chains MUST use `sha256-custody`. Enforced where it
+  can have a name and a row number: `verify_chain({dialect_mode:"custody"})`
+  fails `E_DIALECT_FORBIDDEN` on any canary row. Default mode `"any"` verifies
+  each row under its own dialect (mixed chains legal). Unknown dialect name →
+  `E_UNKNOWN_DIALECT`.
+- **`upgrade_chain({from_seq, to_seq})`** re-hashes a verified chain segment
+  into a NEW standalone custody receipt set under `upgrades/` (bodies
+  byte-identical, seqs renumbered from genesis, timestamp-free manifest →
+  re-runs are byte-identical, source store never mutated).
+- **Versioned tool surface:** the v1 contract (exactly the three tools above,
+  pinned by the untouched test suite) holds by default; run with `--qmr2` (or
+  env `QMR2=1`) to also list the `dialects` + `upgrade_chain` tools. The
+  `tools/list` RESULT always carries an additive `dialects` field (registry +
+  law), and the row-level dialect layer is always active.
+
+## Vendor the tamper-conformance harness (retires the ~8 re-implementations)
+
+`test/conformance.mjs` is the shared battery: tamper trio (body flip →
+`E_HASH_MISMATCH` at_seq · sig flip → `E_BAD_SIGNATURE` · row deletion →
+`E_SEQ_MISMATCH`), replay, wrong-secret, unknown-dialect, empty-body,
+custody-law, determinism, plus a clean-chain positive control. Copy it into
+your repo verbatim (it is dependency-free), write a ~40-line adapter, run:
+
+```js
+import { runConformance } from './conformance.mjs';
+
+const verdict = await runConformance({
+  name: 'my-repo-receipt-chain',
+  features: { dialects: true },          // false → dialect cases are marked skipped, not failed
+  async reset() { /* fresh empty chain */ },
+  makeReceipt(seq, prev, body, { secret, dialect } = {}) { /* sign per your dialect → full receipt */ },
+  async appendRaw(receipt) { /* submit → {ok} | {ok:false, error, at_seq?, detail?} */ },
+  async verify(opts = {}) { /* full audit; opts.dialect_mode? → {ok} | {ok:false, error, at_seq?} */ },
+  async readTip() { /* tip id | null */ },
+  async rows() { /* raw rows (persistence-level read) */ },
+  async rewrite(rows) { /* persistence-level rewrite — tampering happens behind the API's back */ },
+  // errorMap: { yourLegacyName: 'E_HASH_MISMATCH' }  // optional bridge for legacy error names
+});
+assert.equal(verdict.ok, true);            // your chain now speaks the fleet's named fail-closed law
+```
+
+First customer: this harness's own host — `test/adapter-self.mjs` drives the
+real server over stdio MCP, and the run is receipted in
+`receipts/dogfood-67b.jsonl` (see `receipts/DOGFOOD-67B.md`, re-derivable via
+`node scripts/dogfood.mjs`).
 
 ## Why
 
@@ -52,7 +120,9 @@ culture already exists — it just wasn't addressable over a wire. MCP-izing it
 ```sh
 node server.mjs --demo          # seed 5 sample receipts into ./store.jsonl, then serve
 node examples/client-demo.mjs   # end-to-end client drive: handshake → list → read → verify → append
-npm test                        # 15/15 wire-level conformance tests
+npm test                        # 30/30 tests — 15 untouched v1 + 15 qmr2 (dialect layer, custody law,
+                                #   upgrade determinism, conformance self-application)
+node scripts/dogfood.mjs        # re-run the dogfood: harness self-receipt + wal-* external producer
 ```
 
 Environment: `MCP_RECEIPT_SECRET` — HMAC key for the spike scheme. If unset, a
@@ -97,5 +167,8 @@ error at the exact row.
 3. **Host inside the fleet's existing MCP surface** — superinstance-api already
    serves MCP tools (commit `5ded07cd`); the receipt tools join that server so
    the context brain and the receipt chain share one address.
-4. Fleet roll-out: `fleet-seeds` `wal-*` tools become the first real producer;
-   `registry.jsonl` / `lessons.jsonl` rows gain `qmr1` mirrors.
+4. Fleet roll-out: **done for the first producer** — `fleet-seeds`' real
+   `wal-conformance` tool receipted through the shared harness
+   (`receipts/dogfood-67b.jsonl`); next: `registry.jsonl` / `lessons.jsonl`
+   rows gain `qmr1` mirrors, and fleet repos vendor `test/conformance.mjs`
+   instead of re-proving the tamper battery by hand.

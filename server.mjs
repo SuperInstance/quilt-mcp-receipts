@@ -1,19 +1,104 @@
 #!/usr/bin/env node
 // quilt-mcp-receipts — the fleet receipt chain as a signed append-only MCP organ.
-// Spike v1, dialect `qmr1`. Spec: DESIGN.md. Transport: stdio, newline-delimited
-// JSON-RPC 2.0 (MCP handshake + tools/list + tools/call). Stdlib only, no SDK.
+// v0.2.0, dialect family `qmr1` + pluggable-hash layer `qmr2` (docs/qmr2-design.md).
+// Transport: stdio, newline-delimited JSON-RPC 2.0 (MCP handshake + tools/list +
+// tools/call). Stdlib only, no SDK.
+//
+// qmr2 (additive, never rewrites qmr1 semantics):
+//   - row MAY carry `dialect` field; qmr1 rows read as sha256-custody, are never
+//     rewritten on disk
+//   - registry: sha256-custody (custody law) + fnv1a-canary (fast, never custody)
+//   - law: custody chains MUST use sha256-custody → verify_chain({dialect_mode:"custody"})
+//     fails E_DIALECT_FORBIDDEN on any fnv1a-canary row
+//   - portable preimage ("qmr1:seq:prev:canonicalJSON(body)", dialect-independent)
+//     → upgrade_chain re-hashes canary chains into NEW custody receipt sets
+//   - two new tools (`dialects`, `upgrade_chain`) advertise only under --qmr2 / env
+//     QMR2=1, so the v1 tool-name contract pinned by the untouched test suite holds
 
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
 const SERVER_NAME = 'quilt-mcp-receipts';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = '0.2.0';
 const PROTOCOL_VERSION = '2024-11-05';
 const GENESIS_PREV = '0'.repeat(64);
-const DIALECT = 'qmr1';
+const DIALECT = 'qmr1'; // the preimage/domain contract name (qmr1-compatible by design)
+const DEFAULT_DIALECT = 'sha256-custody';
 const DEFAULT_SECRET = 'quilt-mcp-receipts-dev-secret-do-not-use-in-prod';
 const REQUIRED_FIELDS = ['seq', 'prev', 'body', 'id', 'sig'];
+const OPTIONAL_FIELDS = ['dialect'];
+
+// ------------------------------------------------ qmr2 dialect registry (§3)
+// ONE receipt primitive, pluggable hash, ONE law. Adding a dialect = adding a
+// row here + a hash function — never touching the law.
+const FNV_OFFSET = 0xcbf29ce484222325n;
+const FNV_PRIME = 0x100000001b3n;
+const FNV_MASK = (1n << 64n) - 1n;
+function fnv1a64(str) {
+  let h = FNV_OFFSET;
+  for (const b of Buffer.from(str, 'utf8')) {
+    h ^= BigInt(b);
+    h = (h * FNV_PRIME) & FNV_MASK;
+  }
+  return h.toString(16).padStart(16, '0');
+}
+
+const DIALECTS = {
+  'sha256-custody': {
+    hash: 'sha256',
+    custody: true,
+    note: 'qmr1-compatible custody class; ids byte-identical to qmr1',
+    computeId: (preimage) => createHash('sha256').update(preimage).digest('hex'),
+  },
+  'fnv1a-canary': {
+    hash: 'fnv1a-64',
+    custody: false,
+    note: 'fast in-memory chains that will NEVER hold custody (slackwater-quilt refutes canary for custody chains)',
+    computeId: (preimage) => '0x' + fnv1a64(preimage),
+  },
+};
+
+function resolveDialect(name) {
+  // undefined → qmr1 default on read (sha256-custody); anything else must be a
+  // registered name (non-string included → E_UNKNOWN_DIALECT by the caller).
+  if (name === undefined) return DEFAULT_DIALECT;
+  return DIALECTS[name] ? name : null;
+}
+
+function dialectId(dialectName, seq, prev, body) {
+  // Portable preimage (§2): identical string shape across ALL dialects — this is
+  // what makes re-hash upgrading a pure function.
+  const preimage = `qmr1:${seq}:${prev}:${canonicalJSON(body)}`;
+  return DIALECTS[dialectName].computeId(preimage);
+}
+
+function isCustodyId(s) {
+  return typeof s === 'string' && /^[0-9a-f]{64}$/.test(s);
+}
+function isCanaryId(s) {
+  return typeof s === 'string' && /^0x[0-9a-f]{16}$/.test(s);
+}
+// prev form: genesis, or the previous row's id VERBATIM — which may carry EITHER
+// dialect's form, because mixed chains are legal in "any" mode (docs/qmr2-design.md §3):
+// a canary tail may link onto a custody row and vice versa; linkage is string equality.
+function isPrevForm(s) {
+  if (s === GENESIS_PREV) return true;
+  return isCustodyId(s) || isCanaryId(s);
+}
+
+const REGISTRY_INFO = {
+  version: 'qmr2',
+  preimage: 'qmr1:<seq>:<prev>:<canonicalJSON(body)> — identical string shape across dialects (portable preimage, docs/qmr2-design.md §2)',
+  sig: 'HMAC-SHA256(secret, "qmr1:sig:"+id) — shared across dialects; the pluggable surface is the HASH, only the hash',
+  genesis_prev: GENESIS_PREV,
+  law: 'custody chains MUST use sha256-custody: verify_chain({dialect_mode:"custody"}) fails E_DIALECT_FORBIDDEN on any fnv1a-canary row (localized at_seq)',
+  dialects: Object.entries(DIALECTS).map(([name, d]) => ({
+    name, hash: d.hash, custody: d.custody, note: d.note,
+  })),
+  upgrade: 'upgrade_chain({from_seq,to_seq}) re-hashes a verified chain into a NEW standalone custody receipt set under upgrades/ (deterministic, source store never mutated)',
+  spec: 'docs/qmr2-design.md',
+};
 
 // ---------------------------------------------------------------- cli / env
 const argv = process.argv.slice(2);
@@ -42,16 +127,14 @@ function canonicalJSON(value) {
 }
 
 function receiptId(seq, prev, body) {
-  return createHash('sha256').update(`qmr1:${seq}:${prev}:${canonicalJSON(body)}`).digest('hex');
+  return dialectId(DEFAULT_DIALECT, seq, prev, body);
 }
 
 function receiptSig(id) {
   return createHmac('sha256', SECRET).update(`qmr1:sig:${id}`).digest('hex');
 }
 
-function isHex64(s) {
-  return typeof s === 'string' && /^[0-9a-f]{64}$/.test(s);
-}
+const isHex64 = isCustodyId; // qmr1 spelling kept for the seed/read paths below
 
 // ------------------------------------------------------------------ store IO
 // Read path always re-parses from disk: every answer describes the file as it
@@ -78,7 +161,13 @@ function appendLine(obj) {
 
 // ------------------------------------------------------------- verification
 // Re-derives the full chain from genesis; fails closed on the first bad row.
-function verifyChain() {
+// dialectMode: "any" (default — each row verified under its own dialect, mixed
+// chains allowed) | "custody" (the law: every row must be sha256-custody;
+// fnv1a-canary → E_DIALECT_FORBIDDEN, localized at_seq).
+function verifyChain(dialectMode = 'any') {
+  if (dialectMode !== 'any' && dialectMode !== 'custody') {
+    return { ok: false, error: 'E_BAD_ARGS', detail: `dialect_mode must be "any" or "custody", got ${JSON.stringify(dialectMode)}`, count_checked: 0, tip: null };
+  }
   const { receipts, corrupted_lines } = loadStore();
   if (corrupted_lines.length > 0) {
     return {
@@ -98,27 +187,38 @@ function verifyChain() {
 
     if (r === null || typeof r !== 'object' || Array.isArray(r)) return fail('E_BODY_INVALID', 'row is not an object');
     for (const f of REQUIRED_FIELDS) if (!(f in r)) return fail('E_MISSING_FIELD', `missing field "${f}"`);
-    for (const k of Object.keys(r)) if (!REQUIRED_FIELDS.includes(k)) return fail('E_UNKNOWN_FIELD', `unknown field "${k}"`);
+    for (const k of Object.keys(r)) if (!REQUIRED_FIELDS.includes(k) && !OPTIONAL_FIELDS.includes(k)) return fail('E_UNKNOWN_FIELD', `unknown field "${k}"`);
+    // qmr2: dialect name must be registered (undefined = qmr1 row → custody default on read)
+    const dialectName = resolveDialect(r.dialect);
+    if (dialectName === null) return fail('E_UNKNOWN_DIALECT', `dialect ${JSON.stringify(r.dialect)} is not in the registry (registered: ${Object.keys(DIALECTS).join(', ')})`);
+    if (dialectMode === 'custody' && dialectName === 'fnv1a-canary') {
+      return fail('E_DIALECT_FORBIDDEN', `fnv1a-canary row in a chain asserted as custody (law: custody chains MUST use sha256-custody, docs/qmr2-design.md §3)`);
+    }
     if (!Number.isInteger(r.seq) || r.seq < 1) return fail('E_SEQ_MISMATCH', `seq ${JSON.stringify(r.seq)} is not a positive integer`);
-    if (!isHex64(r.prev)) return fail('E_PREV_MISMATCH', `prev is not 64-hex`);
-    if (!isHex64(r.id)) return fail('E_HASH_MISMATCH', `id is not 64-hex`);
+    if (!isPrevForm(r.prev)) return fail('E_PREV_MISMATCH', `prev is not a valid link id (genesis or a registered dialect id form)`);
+    if (dialectName === 'fnv1a-canary' ? !isCanaryId(r.id) : !isHex64(r.id)) return fail('E_HASH_MISMATCH', `id is not a valid ${dialectName} id`);
     if (!isHex64(r.sig)) return fail('E_BAD_SIGNATURE', `sig is not 64-hex`);
     if (!r.body || typeof r.body !== 'object' || Array.isArray(r.body)) return fail('E_BODY_INVALID', 'body must be a JSON object');
     if (typeof r.body.kind !== 'string' || r.body.kind.length === 0) return fail('E_BODY_INVALID', 'body.kind must be a non-empty string');
     if (typeof r.body.ts !== 'string' || r.body.ts.length === 0) return fail('E_BODY_INVALID', 'body.ts must be a non-empty string');
     if (r.seq !== at_seq) return fail('E_SEQ_MISMATCH', `row ${i + 1} claims seq ${r.seq}`);
-    if (r.prev !== prev) return fail('E_PREV_MISMATCH', `row ${r.seq} links to ${r.prev.slice(0, 12)}…, expected ${prev.slice(0, 12)}…`);
-    const recomputedId = receiptId(r.seq, r.prev, r.body);
-    if (r.id !== recomputedId) return fail('E_HASH_MISMATCH', `recomputed id ${recomputedId.slice(0, 12)}… ≠ stored ${r.id.slice(0, 12)}…`);
+    if (r.prev !== prev) return fail('E_PREV_MISMATCH', `row ${r.seq} links to ${String(r.prev).slice(0, 12)}…, expected ${prev.slice(0, 12)}…`);
+    const recomputedId = dialectId(dialectName, r.seq, r.prev, r.body);
+    if (r.id !== recomputedId) return fail('E_HASH_MISMATCH', `recomputed id ${recomputedId.slice(0, 12)}… ≠ stored ${String(r.id).slice(0, 12)}…`);
     const recomputedSig = receiptSig(r.id);
     if (r.sig !== recomputedSig) return fail('E_BAD_SIGNATURE', `HMAC mismatch over id ${r.id.slice(0, 12)}… (wrong secret or altered id)`);
     prev = r.id;
   }
-  return { ok: true, dialect: DIALECT, count: receipts.length, tip: receipts.length ? prev : null };
+  const out = { ok: true, dialect: DIALECT, count: receipts.length, tip: receipts.length ? prev : null };
+  if (dialectMode !== 'any') out.dialect_mode = dialectMode;
+  return out;
 }
 
 // ------------------------------------------------------------------- appends
 // Fail-closed, named errors, first failure wins. Never writes anything invalid.
+// Dialect-neutral by design (docs/qmr2-design.md §3): append cannot know which
+// chains will later be CLAIMED as custody — the named mode assertion at verify
+// is the enforcement instrument.
 function validateAppend(receipt) {
   const { receipts, corrupted_lines } = loadStore();
   if (corrupted_lines.length > 0) {
@@ -131,24 +231,26 @@ function validateAppend(receipt) {
 
   if (receipt === null || typeof receipt !== 'object' || Array.isArray(receipt)) return fail('E_BODY_INVALID', 'receipt must be a JSON object');
   for (const f of REQUIRED_FIELDS) if (!(f in receipt)) return fail('E_MISSING_FIELD', `missing field "${f}"`);
-  for (const k of Object.keys(receipt)) if (!REQUIRED_FIELDS.includes(k)) return fail('E_UNKNOWN_FIELD', `unknown field "${k}"`);
+  for (const k of Object.keys(receipt)) if (!REQUIRED_FIELDS.includes(k) && !OPTIONAL_FIELDS.includes(k)) return fail('E_UNKNOWN_FIELD', `unknown field "${k}"`);
+  const dialectName = resolveDialect(receipt.dialect);
+  if (dialectName === null) return fail('E_UNKNOWN_DIALECT', `dialect ${JSON.stringify(receipt.dialect)} is not in the registry (registered: ${Object.keys(DIALECTS).join(', ')})`);
   if (!Number.isInteger(receipt.seq)) return fail('E_SEQ_MISMATCH', `seq must be an integer, got ${JSON.stringify(receipt.seq)}`);
   if (!receipt.body || typeof receipt.body !== 'object' || Array.isArray(receipt.body)) return fail('E_BODY_INVALID', 'body must be a JSON object');
   if (typeof receipt.body.kind !== 'string' || receipt.body.kind.length === 0) return fail('E_BODY_INVALID', 'body.kind must be a non-empty string');
   if (typeof receipt.body.ts !== 'string' || receipt.body.ts.length === 0) return fail('E_BODY_INVALID', 'body.ts must be a non-empty string');
   if (receipt.seq !== expectedSeq) return fail('E_SEQ_MISMATCH', `expected seq ${expectedSeq}, got ${receipt.seq} (replay or gap)`);
-  if (!isHex64(receipt.prev) || receipt.prev !== expectedPrev) {
-    return fail('E_PREV_MISMATCH', `expected prev ${expectedPrev.slice(0, 12)}…, got ${String(receipt.prev).slice(0, 12)}…`);
+  if (!isPrevForm(receipt.prev) || receipt.prev !== expectedPrev) {
+    return fail('E_PREV_MISMATCH', `expected prev ${String(expectedPrev).slice(0, 12)}…, got ${String(receipt.prev).slice(0, 12)}…`);
   }
-  const recomputedId = receiptId(receipt.seq, receipt.prev, receipt.body);
-  if (!isHex64(receipt.id) || receipt.id !== recomputedId) {
+  const recomputedId = dialectId(dialectName, receipt.seq, receipt.prev, receipt.body);
+  if (receipt.id !== recomputedId) {
     return fail('E_HASH_MISMATCH', `recomputed id ${recomputedId.slice(0, 12)}… ≠ submitted ${String(receipt.id).slice(0, 12)}…`);
   }
   const recomputedSig = receiptSig(receipt.id);
   if (!isHex64(receipt.sig) || receipt.sig !== recomputedSig) {
     return fail('E_BAD_SIGNATURE', `HMAC mismatch over id (wrong secret or altered id)`);
   }
-  return { ok: true, tip };
+  return { ok: true, tip, dialect: dialectName };
 }
 
 // -------------------------------------------------------------- demo seeding
@@ -186,6 +288,81 @@ function seedDemo() {
 
 if (argv.includes('--demo')) seedDemo();
 
+// ------------------------------------------------------------- qmr2 tool layer
+// Versioned capability: the untouched v1 suite pins tools/list to exactly the
+// three qmr1 tools (test #3, "exactly the three receipt-organ tools") — so the
+// two qmr2 tools advertise only under --qmr2 / env QMR2=1. The row-level dialect
+// layer above is ALWAYS active; only the tool listing is versioned.
+const QMR2 = argv.includes('--qmr2') || (process.env.QMR2 !== undefined && process.env.QMR2 !== '' && process.env.QMR2 !== '0');
+
+// upgrade_chain (docs/qmr2-design.md §5): re-hash a VERIFIED chain segment into
+// a NEW standalone custody receipt set. Deterministic: content-derived output
+// name, timestamp-free manifest, so re-running on the same source is
+// byte-identical. The original store is never mutated.
+function upgradeChain(fromSeq, toSeq) {
+  const { receipts, corrupted_lines } = loadStore();
+  if (corrupted_lines.length > 0) {
+    return { ok: false, error: 'E_STORE_CORRUPT', detail: `refusing to upgrade a corrupt store (lines ${corrupted_lines.join(',')})` };
+  }
+  const bad = (error, detail) => ({ ok: false, error, detail });
+  if (!Number.isInteger(fromSeq) || !Number.isInteger(toSeq)) return bad('E_BAD_ARGS', 'from_seq and to_seq must be integers');
+  if (fromSeq < 1 || toSeq < fromSeq) return bad('E_BAD_ARGS', `need 1 <= from_seq <= to_seq, got ${fromSeq}..${toSeq}`);
+  if (toSeq > receipts.length) return bad('E_BAD_ARGS', `to_seq ${toSeq} exceeds chain length ${receipts.length}`);
+  // An upgrade launders nothing: the FULL source chain must verify (any mode —
+  // canary rows are exactly the point of upgrading) before any output is written.
+  const audit = verifyChain('any');
+  if (!audit.ok) return audit;
+
+  const sourceBytes = fs.existsSync(STORE) ? fs.readFileSync(STORE) : Buffer.alloc(0);
+  const sourceSha = createHash('sha256').update(sourceBytes).digest('hex');
+  const sourceTip = audit.tip;
+  const dialectsFrom = [...new Set(receipts.slice(fromSeq - 1, toSeq).map((r) => resolveDialect(r.dialect)))];
+
+  let prev = GENESIS_PREV;
+  const upgraded = [];
+  for (let s = fromSeq; s <= toSeq; s++) {
+    const src = receipts[s - 1];
+    const seq = s - fromSeq + 1; // renumbered: new total order rooted at genesis
+    const body = JSON.parse(JSON.stringify(src.body)); // byte-identical canonical body
+    const id = dialectId(DEFAULT_DIALECT, seq, prev, body);
+    const sig = receiptSig(id);
+    upgraded.push({ seq, prev, body, id, sig, dialect: DEFAULT_DIALECT });
+    prev = id;
+  }
+
+  const name = `upgrade-${fromSeq}-${toSeq}-${sourceSha.slice(0, 8)}.jsonl`;
+  const outDir = path.join(path.dirname(STORE), 'upgrades');
+  fs.mkdirSync(outDir, { recursive: true });
+  const outPath = path.join(outDir, name);
+  const manifestPath = path.join(outDir, name.replace(/\.jsonl$/, '.manifest.json'));
+  const manifest = {
+    source_store: STORE,
+    source_sha256: sourceSha,
+    from_seq: fromSeq,
+    to_seq: toSeq,
+    rows: upgraded.length,
+    source_tip: sourceTip,
+    upgraded_tip: prev,
+    dialect_from: dialectsFrom,
+    dialect_to: DEFAULT_DIALECT,
+    generator: 'quilt-mcp-receipts upgrade_chain v0.2.0',
+    spec: 'docs/qmr2-design.md §5',
+  };
+  fs.writeFileSync(outPath, upgraded.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  return {
+    ok: true,
+    rows_upgraded: upgraded.length,
+    from_seq: fromSeq,
+    to_seq: toSeq,
+    source_tip: sourceTip,
+    upgraded_tip: prev,
+    source_sha256: sourceSha,
+    out: outPath,
+    manifest: manifestPath,
+  };
+}
+
 // ------------------------------------------------------------- MCP tool defs
 const TOOLS = [
   {
@@ -205,16 +382,51 @@ const TOOLS = [
     name: 'verify_chain',
     description:
       'Self-audit: re-derive the full hash chain from genesis (structure, seq, prev linkage, id recomputation, HMAC signature). ' +
-      'Returns {ok:true, count, tip} or fails closed with a named error code (E_PREV_MISMATCH, E_HASH_MISMATCH, E_BAD_SIGNATURE, …) at the first broken row.',
-    inputSchema: { type: 'object', properties: {} },
+      'Returns {ok:true, count, tip} or fails closed with a named error code (E_PREV_MISMATCH, E_HASH_MISMATCH, E_BAD_SIGNATURE, …) at the first broken row. ' +
+      'Optional dialect_mode (qmr2): "any" (default) verifies each row under its own dialect; "custody" enforces the law — any fnv1a-canary row fails E_DIALECT_FORBIDDEN.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dialect_mode: { type: 'string', enum: ['any', 'custody'], default: 'any', description: 'custody asserts the chain is a custody chain (E_DIALECT_FORBIDDEN on canary rows)' },
+      },
+    },
   },
   {
     name: 'append_receipt',
     description:
       'Commit one receipt to the chain. The client builds and signs the full receipt {seq, prev, body, id, sig} per the qmr1 dialect (DESIGN.md): ' +
       'id = sha256("qmr1:"+seq+":"+prev+":"+canonicalJSON(body)); sig = HMAC-SHA256(secret, "qmr1:sig:"+id). ' +
+      'qmr2: the row MAY carry dialect ("sha256-custody" default on read | "fnv1a-canary"); unknown names are rejected E_UNKNOWN_DIALECT. ' +
       'Validation is fail-closed with named errors; nothing invalid is ever written.',
-    inputSchema: { type: 'object', properties: { receipt: { type: 'object', description: 'complete qmr1 receipt incl. seq/prev/id/sig' } }, required: ['receipt'] },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        receipt: { type: 'object', description: 'complete receipt incl. seq/prev/id/sig; optional qmr2 dialect tag' },
+      },
+      required: ['receipt'],
+    },
+  },
+];
+
+const QMR2_TOOLS = [
+  {
+    name: 'dialects',
+    description:
+      'The qmr2 dialect registry: the two registered hash dialects, the portable preimage, and THE law (custody chains MUST use sha256-custody, enforced E_DIALECT_FORBIDDEN). Spec: docs/qmr2-design.md.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'upgrade_chain',
+    description:
+      'Re-hash-upgrade rows [from_seq..to_seq] into a NEW standalone sha256-custody receipt set under upgrades/ (bodies byte-identical, seqs renumbered from genesis, deterministic output, source store never mutated). Refuses fail-closed if the source chain does not verify.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from_seq: { type: 'integer', minimum: 1 },
+        to_seq: { type: 'integer', minimum: 1 },
+      },
+      required: ['from_seq', 'to_seq'],
+    },
   },
 ];
 
@@ -232,8 +444,12 @@ function toolRead(args) {
   return { isError: false, payload };
 }
 
-function toolVerify() {
-  const result = verifyChain();
+function toolVerify(args) {
+  const mode = args && args.dialect_mode !== undefined ? args.dialect_mode : 'any';
+  if (mode !== 'any' && mode !== 'custody') {
+    return { isError: true, payload: { ok: false, error: 'E_BAD_ARGS', detail: `dialect_mode must be "any" or "custody", got ${JSON.stringify(mode)}` } };
+  }
+  const result = verifyChain(mode);
   return { isError: result.ok !== true, payload: result };
 }
 
@@ -244,15 +460,32 @@ function toolAppend(args) {
   const verdict = validateAppend(args.receipt);
   if (verdict.error) return { isError: true, payload: { ok: false, ...verdict } };
   const r = args.receipt;
-  appendLine({ seq: r.seq, prev: r.prev, body: r.body, id: r.id, sig: r.sig });
-  return { isError: false, payload: { ok: true, seq: r.seq, id: r.id, tip: r.id, dialect: DIALECT } };
+  // Write what the client submitted: qmr1 rows stay five-field (never inject a
+  // dialect tag), dialect-tagged rows keep their tag verbatim (never rewrite).
+  const row = { seq: r.seq, prev: r.prev, body: r.body, id: r.id, sig: r.sig };
+  if (r.dialect !== undefined) row.dialect = r.dialect;
+  appendLine(row);
+  return { isError: false, payload: { ok: true, seq: r.seq, id: r.id, tip: r.id, dialect: verdict.dialect } };
+}
+
+function toolDialects() {
+  return { isError: false, payload: { ok: true, ...REGISTRY_INFO } };
+}
+
+function toolUpgrade(args) {
+  const from = args && args.from_seq;
+  const to = args && args.to_seq;
+  const result = upgradeChain(from, to);
+  return { isError: result.ok !== true, payload: result };
 }
 
 function callTool(name, args) {
   switch (name) {
     case 'read_receipts': return toolRead(args);
-    case 'verify_chain': return toolVerify();
+    case 'verify_chain': return toolVerify(args);
     case 'append_receipt': return toolAppend(args);
+    case 'dialects': return QMR2 ? toolDialects() : null;
+    case 'upgrade_chain': return QMR2 ? toolUpgrade(args) : null;
     default: return null; // unknown tool
   }
 }
@@ -290,11 +523,15 @@ function handleRequest(msg) {
     case 'ping':
       return result(id, {});
     case 'tools/list':
-      return result(id, { tools: TOOLS });
+      // Additive qmr2 field: the dialect registry + the law ride along on every
+      // tools/list result (v1 clients read `tools`, qmr2 clients read `dialects`).
+      // The two qmr2 TOOLS are listed only in qmr2 mode (--qmr2 / env QMR2=1).
+      return result(id, { tools: QMR2 ? [...TOOLS, ...QMR2_TOOLS] : TOOLS, dialects: REGISTRY_INFO });
     case 'tools/call': {
       const name = params && params.name;
       if (typeof name !== 'string') return errorReply(id, ERR_INVALID_PARAMS, 'params.name must be a string');
-      if (!TOOLS.some((t) => t.name === name)) return errorReply(id, ERR_INVALID_PARAMS, `unknown tool: ${name}`);
+      const activeTools = QMR2 ? [...TOOLS, ...QMR2_TOOLS] : TOOLS;
+      if (!activeTools.some((t) => t.name === name)) return errorReply(id, ERR_INVALID_PARAMS, `unknown tool: ${name}`);
       const args = params.arguments && typeof params.arguments === 'object' ? params.arguments : {};
       const out = callTool(name, args);
       if (out === null) return errorReply(id, ERR_METHOD_NOT_FOUND, `unknown tool: ${name}`);

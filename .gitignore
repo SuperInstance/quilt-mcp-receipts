@@ -1,0 +1,4 @@
+# runtime stores are never committed (demo stores are reproducible via --demo)
+store.jsonl
+*.tmp.jsonl
+node_modules/

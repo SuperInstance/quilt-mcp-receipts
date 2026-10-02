@@ -1,0 +1,16 @@
+{
+  "name": "quilt-mcp-receipts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The fleet receipt chain as a signed append-only MCP organ (spike v1, dialect qmr1). Stdio JSON-RPC 2.0, stdlib only.",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "test": "node --test",
+    "demo": "node examples/client-demo.mjs"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "license": "MIT"
+}

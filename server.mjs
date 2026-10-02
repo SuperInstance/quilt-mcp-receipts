@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // quilt-mcp-receipts — the fleet receipt chain as a signed append-only MCP organ.
-// v0.2.0, dialect family `qmr1` + pluggable-hash layer `qmr2` (docs/qmr2-design.md).
+// v0.3.0, dialect family `qmr1` + pluggable-hash layer `qmr2` + attribution layer
+// `v3` (docs/qmr2-design.md §8).
 // Transport: stdio, newline-delimited JSON-RPC 2.0 (MCP handshake + tools/list +
 // tools/call). Stdlib only, no SDK.
 //
@@ -14,20 +15,81 @@
 //     → upgrade_chain re-hashes canary chains into NEW custody receipt sets
 //   - two new tools (`dialects`, `upgrade_chain`) advertise only under --qmr2 / env
 //     QMR2=1, so the v1 tool-name contract pinned by the untouched test suite holds
+//
+// v3 attribution (additive; the sig SLOT opens the way the hash slot did):
+//   - row MAY carry `sigAlg` + `sigKeyFp`; rows without them are qmr1 HMAC rows,
+//     byte-unchanged and never rewritten
+//   - sigAlg "ed25519": sig = Ed25519 over "qmr1:sig:"+id (128-hex); sigKeyFp =
+//     sha256 of the signer's SPKI PEM (the SAME fingerprint law as
+//     quilt-jev-toolkit's organ v3 — one identity, two organs, zero shared secrets)
+//   - verify_chain gains an optional keyring {fingerprint → publicKeyPem}; a row
+//     signed under a fingerprint not in the keyring → E_UNKNOWN_SIGNER (fail-closed)
+//   - new tool `verify_attribution` (advertises under --v3 / env V3=1 — same
+//     versioned-capability pattern as qmr2) reports WHO signed each row
+//   - HMAC's honest residual stays receipted: a shared secret has no per-signer
+//     identity — attribution is fleet-trust until v3
 
-import { createHash, createHmac, randomUUID } from 'node:crypto';
+import { createHash, createHmac, createPublicKey, randomUUID, verify as cryptoVerify } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
 const SERVER_NAME = 'quilt-mcp-receipts';
-const SERVER_VERSION = '0.2.0';
+const SERVER_VERSION = '0.3.0';
 const PROTOCOL_VERSION = '2024-11-05';
 const GENESIS_PREV = '0'.repeat(64);
 const DIALECT = 'qmr1'; // the preimage/domain contract name (qmr1-compatible by design)
 const DEFAULT_DIALECT = 'sha256-custody';
 const DEFAULT_SECRET = 'quilt-mcp-receipts-dev-secret-do-not-use-in-prod';
 const REQUIRED_FIELDS = ['seq', 'prev', 'body', 'id', 'sig'];
-const OPTIONAL_FIELDS = ['dialect'];
+const OPTIONAL_FIELDS = ['dialect', 'sigAlg', 'sigKeyFp'];
+
+// -------------------------------------------------- v3 sig-scheme registry (§8)
+// The sig SLOT opens the way the hash slot opened: registry + named law +
+// fail-closed verification, and the default (absent field) stays qmr1.
+const DEFAULT_SIGALG = 'hmac-sha256';
+const FINGERPRINT_HEX = /^[0-9a-f]{64}$/;
+const ED25519_SIG_HEX = /^[0-9a-f]{128}$/; // Ed25519 sigs are 64 bytes
+
+// THE FINGERPRINT LAW (shared byte-for-byte with quilt-jev-toolkit's organ v3):
+// sha256 over the normalized SPKI PEM (`createPublicKey(pem).export({type:'spki',
+// format:'pem'})`, trailing newline included) → 64 lowercase hex.
+function ed25519KeyFingerprint(pem) {
+  return createHash('sha256').update(createPublicKey(pem).export({ type: 'spki', format: 'pem' })).digest('hex');
+}
+
+function ed25519VerifySig(publicKeyPem, id, sigHex) {
+  if (typeof sigHex !== 'string' || !ED25519_SIG_HEX.test(sigHex)) return false;
+  try {
+    return cryptoVerify(null, Buffer.from(`qmr1:sig:${id}`, 'utf8'), publicKeyPem, Buffer.from(sigHex, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+/** Validate a keyring {fingerprint → publicKeyPem} up front — fail-closed
+ *  BEFORE any row is consulted: a mislabeled or unparseable key is a broken
+ *  trust root, not a signature failure. Returns null or an error object. */
+function keyringError(keyring) {
+  if (keyring === null || keyring === undefined) return null;
+  if (typeof keyring !== 'object' || Array.isArray(keyring)) {
+    return { error: 'E_BAD_KEYRING', detail: 'keyring must be an object {fingerprint → publicKeyPem}' };
+  }
+  for (const [fp, pem] of Object.entries(keyring)) {
+    if (!FINGERPRINT_HEX.test(fp)) {
+      return { error: 'E_BAD_KEYRING', detail: `keyring fingerprint ${JSON.stringify(fp.slice(0, 24))} is not 64-hex (sha256 of the key's SPKI PEM)` };
+    }
+    let realFp;
+    try {
+      realFp = ed25519KeyFingerprint(pem);
+    } catch {
+      return { error: 'E_BAD_KEYRING', detail: `keyring[${fp.slice(0, 12)}…] does not hold a parseable public key PEM` };
+    }
+    if (realFp !== fp) {
+      return { error: 'E_BAD_KEYRING', detail: `keyring[${fp.slice(0, 12)}…] is mislabeled — the key it holds bears fingerprint ${realFp.slice(0, 12)}…` };
+    }
+  }
+  return null;
+}
 
 // ------------------------------------------------ qmr2 dialect registry (§3)
 // ONE receipt primitive, pluggable hash, ONE law. Adding a dialect = adding a
@@ -90,12 +152,17 @@ function isPrevForm(s) {
 const REGISTRY_INFO = {
   version: 'qmr2',
   preimage: 'qmr1:<seq>:<prev>:<canonicalJSON(body)> — identical string shape across dialects (portable preimage, docs/qmr2-design.md §2)',
-  sig: 'HMAC-SHA256(secret, "qmr1:sig:"+id) — shared across dialects; the pluggable surface is the HASH, only the hash',
+  sig: 'HMAC-SHA256(secret, "qmr1:sig:"+id) — the qmr1 default across dialects; v3 adds the pluggable SIG slot (sigAlg "ed25519" + sigKeyFp, docs/qmr2-design.md §8)',
   genesis_prev: GENESIS_PREV,
   law: 'custody chains MUST use sha256-custody: verify_chain({dialect_mode:"custody"}) fails E_DIALECT_FORBIDDEN on any fnv1a-canary row (localized at_seq)',
   dialects: Object.entries(DIALECTS).map(([name, d]) => ({
     name, hash: d.hash, custody: d.custody, note: d.note,
   })),
+  sig_schemes: [
+    { name: 'hmac-sha256', default: true, keyring: false, note: 'qmr1 shared secret — one anonymous writer, no per-signer identity (the honest residual)' },
+    { name: 'ed25519', default: false, keyring: true, note: 'v3 attribution: sig = Ed25519("qmr1:sig:"+id), 128-hex; sigKeyFp = sha256 of the signer\'s SPKI PEM; verify_chain({keyring:{fingerprint→publicKeyPem}}) refuses E_UNKNOWN_SIGNER (fail-closed)' },
+  ],
+  fingerprint: 'sha256(normalized SPKI PEM of the public key) → 64-hex — the SAME law as quilt-jev-toolkit\'s organ v3 checkpoints (one identity, two organs, zero shared secrets)',
   upgrade: 'upgrade_chain({from_seq,to_seq}) re-hashes a verified chain into a NEW standalone custody receipt set under upgrades/ (deterministic, source store never mutated)',
   spec: 'docs/qmr2-design.md',
 };
@@ -161,12 +228,29 @@ function appendLine(obj) {
 
 // ------------------------------------------------------------- verification
 // Re-derives the full chain from genesis; fails closed on the first bad row.
-// dialectMode: "any" (default — each row verified under its own dialect, mixed
-// chains allowed) | "custody" (the law: every row must be sha256-custody;
-// fnv1a-canary → E_DIALECT_FORBIDDEN, localized at_seq).
-function verifyChain(dialectMode = 'any') {
+// verifyChain(opts): opts may be the legacy mode string ("any"|"custody") or
+// { dialect_mode?: "any"|"custody", keyring?: {fingerprint → publicKeyPem} }.
+// dialectMode "any" (default): each row verified under its own dialect, mixed
+// chains allowed. "custody": the law — every row must be sha256-custody
+// (fnv1a-canary → E_DIALECT_FORBIDDEN, localized at_seq).
+// keyring (v3, docs/qmr2-design.md §8): required by ed25519-signed rows; a row
+// whose sigKeyFp is not in the keyring → E_UNKNOWN_SIGNER (fail-closed — an
+// unverifiable signer is an unknown signer). HMAC rows ignore the keyring.
+function verifyChain(opts = 'any') {
+  let dialectMode = 'any';
+  let keyring = null;
+  if (typeof opts === 'string') {
+    dialectMode = opts;
+  } else if (opts && typeof opts === 'object') {
+    dialectMode = opts.dialect_mode === undefined ? 'any' : opts.dialect_mode;
+    keyring = opts.keyring === undefined ? null : opts.keyring;
+  }
   if (dialectMode !== 'any' && dialectMode !== 'custody') {
     return { ok: false, error: 'E_BAD_ARGS', detail: `dialect_mode must be "any" or "custody", got ${JSON.stringify(dialectMode)}`, count_checked: 0, tip: null };
+  }
+  const badKeyring = keyringError(keyring);
+  if (badKeyring) {
+    return { ok: false, ...badKeyring, detail: `${badKeyring.detail} — the trust root itself is broken, refusing before any row is read`, count_checked: 0, tip: null };
   }
   const { receipts, corrupted_lines } = loadStore();
   if (corrupted_lines.length > 0) {
@@ -197,7 +281,26 @@ function verifyChain(dialectMode = 'any') {
     if (!Number.isInteger(r.seq) || r.seq < 1) return fail('E_SEQ_MISMATCH', `seq ${JSON.stringify(r.seq)} is not a positive integer`);
     if (!isPrevForm(r.prev)) return fail('E_PREV_MISMATCH', `prev is not a valid link id (genesis or a registered dialect id form)`);
     if (dialectName === 'fnv1a-canary' ? !isCanaryId(r.id) : !isHex64(r.id)) return fail('E_HASH_MISMATCH', `id is not a valid ${dialectName} id`);
-    if (!isHex64(r.sig)) return fail('E_BAD_SIGNATURE', `sig is not 64-hex`);
+    // -- v3 sig law (docs/qmr2-design.md §8) ---------------------------------
+    // A row without sigAlg is a qmr1 row: HMAC under the shared secret. The
+    // sig SLOT is pluggable the way the hash slot is: registry + named
+    // refusals, default preserved, nothing ever rewritten.
+    const sigAlg = r.sigAlg === undefined ? DEFAULT_SIGALG : r.sigAlg;
+    if (typeof sigAlg !== 'string' || (sigAlg !== 'hmac-sha256' && sigAlg !== 'ed25519')) {
+      return fail('E_UNKNOWN_SIGALG', `sigAlg ${JSON.stringify(r.sigAlg)} is not registered (registered: hmac-sha256, ed25519)`);
+    }
+    if (r.sigKeyFp !== undefined && sigAlg !== 'ed25519') {
+      return fail('E_SIGNER_MALFORMED', 'sigKeyFp is only meaningful on ed25519-signed rows — a shared-secret HMAC has no signer identity');
+    }
+    if (r.sigKeyFp !== undefined && (typeof r.sigKeyFp !== 'string' || !FINGERPRINT_HEX.test(r.sigKeyFp))) {
+      return fail('E_SIGNER_MALFORMED', 'sigKeyFp must be 64-hex (sha256 of the signer\'s SPKI PEM)');
+    }
+    if (sigAlg === 'ed25519' && r.sigKeyFp === undefined) {
+      return fail('E_MISSING_FIELD', 'ed25519-signed row missing "sigKeyFp" — an unnamed signer cannot be verified');
+    }
+    if (sigAlg === 'ed25519' ? !ED25519_SIG_HEX.test(r.sig) : !isHex64(r.sig)) {
+      return fail('E_BAD_SIGNATURE', `sig is not ${sigAlg === 'ed25519' ? '128-hex (Ed25519)' : '64-hex'}`);
+    }
     if (!r.body || typeof r.body !== 'object' || Array.isArray(r.body)) return fail('E_BODY_INVALID', 'body must be a JSON object');
     if (typeof r.body.kind !== 'string' || r.body.kind.length === 0) return fail('E_BODY_INVALID', 'body.kind must be a non-empty string');
     if (typeof r.body.ts !== 'string' || r.body.ts.length === 0) return fail('E_BODY_INVALID', 'body.ts must be a non-empty string');
@@ -205,8 +308,21 @@ function verifyChain(dialectMode = 'any') {
     if (r.prev !== prev) return fail('E_PREV_MISMATCH', `row ${r.seq} links to ${String(r.prev).slice(0, 12)}…, expected ${prev.slice(0, 12)}…`);
     const recomputedId = dialectId(dialectName, r.seq, r.prev, r.body);
     if (r.id !== recomputedId) return fail('E_HASH_MISMATCH', `recomputed id ${recomputedId.slice(0, 12)}… ≠ stored ${String(r.id).slice(0, 12)}…`);
-    const recomputedSig = receiptSig(r.id);
-    if (r.sig !== recomputedSig) return fail('E_BAD_SIGNATURE', `HMAC mismatch over id ${r.id.slice(0, 12)}… (wrong secret or altered id)`);
+    if (sigAlg === 'hmac-sha256') {
+      const recomputedSig = receiptSig(r.id);
+      if (r.sig !== recomputedSig) return fail('E_BAD_SIGNATURE', `HMAC mismatch over id ${r.id.slice(0, 12)}… (wrong secret or altered id)`);
+    } else {
+      // v3: the row NAMES its signer; the keyring must hold that exact key.
+      if (!keyring) {
+        return fail('E_UNKNOWN_SIGNER', `row signed by ${r.sigKeyFp.slice(0, 12)}… but no keyring was provided — attribution is fail-closed (docs/qmr2-design.md §8)`);
+      }
+      if (!(r.sigKeyFp in keyring)) {
+        return fail('E_UNKNOWN_SIGNER', `no key in the keyring bears fingerprint ${r.sigKeyFp.slice(0, 12)}… — an unverifiable signer is an unknown signer`);
+      }
+      if (!ed25519VerifySig(keyring[r.sigKeyFp], r.id, r.sig)) {
+        return fail('E_BAD_SIGNATURE', `Ed25519 signature does not verify under keyring[${r.sigKeyFp.slice(0, 12)}…] over id ${r.id.slice(0, 12)}… (forged sig, altered id, or the wrong key under that fingerprint)`);
+      }
+    }
     prev = r.id;
   }
   const out = { ok: true, dialect: DIALECT, count: receipts.length, tip: receipts.length ? prev : null };
@@ -219,7 +335,7 @@ function verifyChain(dialectMode = 'any') {
 // Dialect-neutral by design (docs/qmr2-design.md §3): append cannot know which
 // chains will later be CLAIMED as custody — the named mode assertion at verify
 // is the enforcement instrument.
-function validateAppend(receipt) {
+function validateAppend(receipt, keyring = null) {
   const { receipts, corrupted_lines } = loadStore();
   if (corrupted_lines.length > 0) {
     return { error: 'E_STORE_CORRUPT', detail: `refusing to append onto a corrupt store (lines ${corrupted_lines.join(',')})` };
@@ -246,11 +362,44 @@ function validateAppend(receipt) {
   if (receipt.id !== recomputedId) {
     return fail('E_HASH_MISMATCH', `recomputed id ${recomputedId.slice(0, 12)}… ≠ submitted ${String(receipt.id).slice(0, 12)}…`);
   }
-  const recomputedSig = receiptSig(receipt.id);
-  if (!isHex64(receipt.sig) || receipt.sig !== recomputedSig) {
-    return fail('E_BAD_SIGNATURE', `HMAC mismatch over id (wrong secret or altered id)`);
+  // v3 sig law at the door (mirrors verifyChain): an ed25519 row must name a
+  // signer the submitted keyring can prove — append never accepts a row it
+  // cannot attribute (fail-closed).
+  const sigAlg = receipt.sigAlg === undefined ? DEFAULT_SIGALG : receipt.sigAlg;
+  if (typeof sigAlg !== 'string' || (sigAlg !== 'hmac-sha256' && sigAlg !== 'ed25519')) {
+    return fail('E_UNKNOWN_SIGALG', `sigAlg ${JSON.stringify(receipt.sigAlg)} is not registered (registered: hmac-sha256, ed25519)`);
   }
-  return { ok: true, tip, dialect: dialectName };
+  if (receipt.sigKeyFp !== undefined && sigAlg !== 'ed25519') {
+    return fail('E_SIGNER_MALFORMED', 'sigKeyFp is only meaningful on ed25519-signed rows — a shared-secret HMAC has no signer identity');
+  }
+  if (receipt.sigKeyFp !== undefined && (typeof receipt.sigKeyFp !== 'string' || !FINGERPRINT_HEX.test(receipt.sigKeyFp))) {
+    return fail('E_SIGNER_MALFORMED', 'sigKeyFp must be 64-hex (sha256 of the signer\'s SPKI PEM)');
+  }
+  if (sigAlg === 'ed25519' && receipt.sigKeyFp === undefined) {
+    return fail('E_MISSING_FIELD', 'ed25519-signed row missing "sigKeyFp" — an unnamed signer cannot be verified');
+  }
+  if (sigAlg === 'hmac-sha256') {
+    const recomputedSig = receiptSig(receipt.id);
+    if (!isHex64(receipt.sig) || receipt.sig !== recomputedSig) {
+      return fail('E_BAD_SIGNATURE', `HMAC mismatch over id (wrong secret or altered id)`);
+    }
+  } else {
+    if (!ED25519_SIG_HEX.test(receipt.sig ?? '')) {
+      return fail('E_BAD_SIGNATURE', 'sig is not 128-hex (Ed25519)');
+    }
+    const badKeyring = keyringError(keyring);
+    if (badKeyring) return badKeyring;
+    if (!keyring) {
+      return fail('E_UNKNOWN_SIGNER', `append cannot verify an Ed25519 row signed by ${receipt.sigKeyFp.slice(0, 12)}… without a keyring — pass arguments.keyring {fingerprint → publicKeyPem} (fail-closed, docs/qmr2-design.md §8)`);
+    }
+    if (!(receipt.sigKeyFp in keyring)) {
+      return fail('E_UNKNOWN_SIGNER', `no key in the keyring bears fingerprint ${receipt.sigKeyFp.slice(0, 12)}… — an unverifiable signer is an unknown signer`);
+    }
+    if (!ed25519VerifySig(keyring[receipt.sigKeyFp], receipt.id, receipt.sig)) {
+      return fail('E_BAD_SIGNATURE', `Ed25519 signature does not verify under keyring[${receipt.sigKeyFp.slice(0, 12)}…] over id (forged sig, altered id, or the wrong key under that fingerprint)`);
+    }
+  }
+  return { ok: true, tip, dialect: dialectName, sigAlg };
 }
 
 // -------------------------------------------------------------- demo seeding
@@ -345,7 +494,7 @@ function upgradeChain(fromSeq, toSeq) {
     upgraded_tip: prev,
     dialect_from: dialectsFrom,
     dialect_to: DEFAULT_DIALECT,
-    generator: 'quilt-mcp-receipts upgrade_chain v0.2.0',
+    generator: 'quilt-mcp-receipts upgrade_chain v0.3.0',
     spec: 'docs/qmr2-design.md §5',
   };
   fs.writeFileSync(outPath, upgraded.map((r) => JSON.stringify(r)).join('\n') + '\n');
@@ -381,13 +530,15 @@ const TOOLS = [
   {
     name: 'verify_chain',
     description:
-      'Self-audit: re-derive the full hash chain from genesis (structure, seq, prev linkage, id recomputation, HMAC signature). ' +
+      'Self-audit: re-derive the full hash chain from genesis (structure, seq, prev linkage, id recomputation, signature). ' +
       'Returns {ok:true, count, tip} or fails closed with a named error code (E_PREV_MISMATCH, E_HASH_MISMATCH, E_BAD_SIGNATURE, …) at the first broken row. ' +
-      'Optional dialect_mode (qmr2): "any" (default) verifies each row under its own dialect; "custody" enforces the law — any fnv1a-canary row fails E_DIALECT_FORBIDDEN.',
+      'Optional dialect_mode (qmr2): "any" (default) verifies each row under its own dialect; "custody" enforces the law — any fnv1a-canary row fails E_DIALECT_FORBIDDEN. ' +
+      'Optional keyring (v3): {fingerprint → publicKeyPem} — ed25519-signed rows verify under the keyring and refuse E_UNKNOWN_SIGNER if their signer is absent.',
     inputSchema: {
       type: 'object',
       properties: {
         dialect_mode: { type: 'string', enum: ['any', 'custody'], default: 'any', description: 'custody asserts the chain is a custody chain (E_DIALECT_FORBIDDEN on canary rows)' },
+        keyring: { type: 'object', description: 'v3 attribution: {fingerprint → publicKeyPem}; ed25519 rows require their signer here (E_UNKNOWN_SIGNER otherwise)', additionalProperties: { type: 'string' } },
       },
     },
   },
@@ -397,11 +548,13 @@ const TOOLS = [
       'Commit one receipt to the chain. The client builds and signs the full receipt {seq, prev, body, id, sig} per the qmr1 dialect (DESIGN.md): ' +
       'id = sha256("qmr1:"+seq+":"+prev+":"+canonicalJSON(body)); sig = HMAC-SHA256(secret, "qmr1:sig:"+id). ' +
       'qmr2: the row MAY carry dialect ("sha256-custody" default on read | "fnv1a-canary"); unknown names are rejected E_UNKNOWN_DIALECT. ' +
+      'v3: the row MAY instead carry sigAlg:"ed25519" + sigKeyFp (Ed25519 over "qmr1:sig:"+id, 128-hex); the arguments MUST then include a keyring proving that signer, else E_UNKNOWN_SIGNER. ' +
       'Validation is fail-closed with named errors; nothing invalid is ever written.',
     inputSchema: {
       type: 'object',
       properties: {
-        receipt: { type: 'object', description: 'complete receipt incl. seq/prev/id/sig; optional qmr2 dialect tag' },
+        receipt: { type: 'object', description: 'complete receipt incl. seq/prev/id/sig; optional qmr2 dialect tag; optional v3 sigAlg+sigKeyFp' },
+        keyring: { type: 'object', description: 'v3: {fingerprint → publicKeyPem} — required to append ed25519-signed rows', additionalProperties: { type: 'string' } },
       },
       required: ['receipt'],
     },
@@ -430,6 +583,26 @@ const QMR2_TOOLS = [
   },
 ];
 
+// v3 attribution tool (docs/qmr2-design.md §8) — same versioned-capability
+// pattern as qmr2: advertise only under --v3 / env V3=1, so the v1 (3 tools)
+// and qmr2 (5 tools) tool-name contracts pinned by the untouched suites hold.
+const V3 = argv.includes('--v3') || (process.env.V3 !== undefined && process.env.V3 !== '' && process.env.V3 !== '0');
+
+const V3_TOOLS = [
+  {
+    name: 'verify_attribution',
+    description:
+      'v3 attribution: verify the chain under a keyring {fingerprint → publicKeyPem} (fail-closed, E_UNKNOWN_SIGNER) and report WHO signed each row — ' +
+      'ed25519 rows name their signer by fingerprint, hmac rows report the honest residual (one anonymous writer). Spec: docs/qmr2-design.md §8.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        keyring: { type: 'object', description: '{fingerprint → publicKeyPem} — ed25519 rows require their signer here', additionalProperties: { type: 'string' } },
+      },
+    },
+  },
+];
+
 // ---------------------------------------------------------------- tool calls
 function toolRead(args) {
   const since = args && args.since_seq !== undefined ? args.since_seq : 0;
@@ -449,7 +622,8 @@ function toolVerify(args) {
   if (mode !== 'any' && mode !== 'custody') {
     return { isError: true, payload: { ok: false, error: 'E_BAD_ARGS', detail: `dialect_mode must be "any" or "custody", got ${JSON.stringify(mode)}` } };
   }
-  const result = verifyChain(mode);
+  const keyring = args && args.keyring !== undefined ? args.keyring : null;
+  const result = verifyChain({ dialect_mode: mode, keyring });
   return { isError: result.ok !== true, payload: result };
 }
 
@@ -457,19 +631,67 @@ function toolAppend(args) {
   if (!args || typeof args !== 'object' || !('receipt' in args)) {
     return { isError: true, payload: { ok: false, error: 'E_MISSING_FIELD', detail: 'arguments.receipt is required' } };
   }
-  const verdict = validateAppend(args.receipt);
+  const keyring = args.keyring !== undefined ? args.keyring : null;
+  const verdict = validateAppend(args.receipt, keyring);
   if (verdict.error) return { isError: true, payload: { ok: false, ...verdict } };
   const r = args.receipt;
   // Write what the client submitted: qmr1 rows stay five-field (never inject a
-  // dialect tag), dialect-tagged rows keep their tag verbatim (never rewrite).
+  // dialect tag), dialect-tagged rows keep their tag verbatim, and v3 rows keep
+  // sigAlg/sigKeyFp verbatim — never rewrite, never inject (never-delete-data
+  // applies to SHAPE too).
   const row = { seq: r.seq, prev: r.prev, body: r.body, id: r.id, sig: r.sig };
   if (r.dialect !== undefined) row.dialect = r.dialect;
+  if (r.sigAlg !== undefined) row.sigAlg = r.sigAlg;
+  if (r.sigKeyFp !== undefined) row.sigKeyFp = r.sigKeyFp;
   appendLine(row);
-  return { isError: false, payload: { ok: true, seq: r.seq, id: r.id, tip: r.id, dialect: verdict.dialect } };
+  return { isError: false, payload: { ok: true, seq: r.seq, id: r.id, tip: r.id, dialect: verdict.dialect, sigAlg: verdict.sigAlg } };
 }
 
 function toolDialects() {
   return { isError: false, payload: { ok: true, ...REGISTRY_INFO } };
+}
+
+// v3 attribution (docs/qmr2-design.md §8): WHO signed each row, per the
+// keyring. The chain must FULLY verify under that keyring first (the same
+// fail-closed law as verify_chain — E_UNKNOWN_SIGNER included); only then is
+// the per-row attribution report produced. HMAC rows report the honest
+// residual: a shared secret has one anonymous writer.
+function toolAttribution(args) {
+  const keyring = args && args.keyring !== undefined ? args.keyring : null;
+  const badKeyring = keyringError(keyring);
+  if (badKeyring) return { isError: true, payload: { ok: false, ...badKeyring } };
+  const verdict = verifyChain({ dialect_mode: 'any', keyring });
+  if (!verdict.ok) return { isError: true, payload: verdict };
+  const { receipts } = loadStore();
+  const attribution = receipts.map((r) => {
+    if (r.sigAlg === 'ed25519') {
+      const known = keyring !== null && r.sigKeyFp in keyring;
+      return {
+        seq: r.seq,
+        sigAlg: 'ed25519',
+        sigKeyFp: r.sigKeyFp,
+        signedBy: known
+          ? { fingerprint: r.sigKeyFp, verified: true, source: 'keyring' }
+          : { fingerprint: r.sigKeyFp, verified: false, reason: 'E_UNKNOWN_SIGNER' },
+      };
+    }
+    return {
+      seq: r.seq,
+      sigAlg: 'hmac-sha256',
+      sigKeyFp: null,
+      signedBy: { fingerprint: null, verified: true, note: 'shared-secret HMAC — one anonymous writer; the honest residual (v3 adds per-signer identity)' },
+    };
+  });
+  const payload = {
+    ok: true,
+    count: verdict.count,
+    tip: verdict.tip,
+    keyring_size: keyring ? Object.keys(keyring).length : 0,
+    attribution,
+    law: 'the chain verifies under the keyring first (E_UNKNOWN_SIGNER is fail-closed); sigKeyFp = sha256 of the signer\'s SPKI PEM — the same fingerprint law as quilt-jev-toolkit organ v3',
+    spec: 'docs/qmr2-design.md §8',
+  };
+  return { isError: false, payload };
 }
 
 function toolUpgrade(args) {
@@ -486,6 +708,7 @@ function callTool(name, args) {
     case 'append_receipt': return toolAppend(args);
     case 'dialects': return QMR2 ? toolDialects() : null;
     case 'upgrade_chain': return QMR2 ? toolUpgrade(args) : null;
+    case 'verify_attribution': return V3 ? toolAttribution(args) : null;
     default: return null; // unknown tool
   }
 }
@@ -525,12 +748,13 @@ function handleRequest(msg) {
     case 'tools/list':
       // Additive qmr2 field: the dialect registry + the law ride along on every
       // tools/list result (v1 clients read `tools`, qmr2 clients read `dialects`).
-      // The two qmr2 TOOLS are listed only in qmr2 mode (--qmr2 / env QMR2=1).
-      return result(id, { tools: QMR2 ? [...TOOLS, ...QMR2_TOOLS] : TOOLS, dialects: REGISTRY_INFO });
+      // The two qmr2 TOOLS are listed only in qmr2 mode (--qmr2 / env QMR2=1);
+      // the v3 attribution tool only under --v3 / env V3=1 (same pattern).
+      return result(id, { tools: [...TOOLS, ...(QMR2 ? QMR2_TOOLS : []), ...(V3 ? V3_TOOLS : [])], dialects: REGISTRY_INFO });
     case 'tools/call': {
       const name = params && params.name;
       if (typeof name !== 'string') return errorReply(id, ERR_INVALID_PARAMS, 'params.name must be a string');
-      const activeTools = QMR2 ? [...TOOLS, ...QMR2_TOOLS] : TOOLS;
+      const activeTools = [...TOOLS, ...(QMR2 ? QMR2_TOOLS : []), ...(V3 ? V3_TOOLS : [])];
       if (!activeTools.some((t) => t.name === name)) return errorReply(id, ERR_INVALID_PARAMS, `unknown tool: ${name}`);
       const args = params.arguments && typeof params.arguments === 'object' ? params.arguments : {};
       const out = callTool(name, args);

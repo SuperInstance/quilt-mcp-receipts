@@ -1,6 +1,6 @@
 {
   "name": "quilt-mcp-receipts",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "The fleet receipt chain as a signed append-only MCP organ (qmr1 custody + qmr2 pluggable-hash dialect layer + shared tamper-conformance harness). Stdio JSON-RPC 2.0, stdlib only.",
   "type": "module",

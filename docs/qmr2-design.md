@@ -200,3 +200,92 @@ grows by adding one table row + one hash function, not by touching the law), no
 mixed-chain prohibition in default mode (custody assertions are opt-in and
 named), no migration of qmr1 stores (qmr1 rows ARE custody rows by default),
 no HTTP transport, no anchoring. Each stays a later-lane item.
+
+---
+
+## 8. v3 attribution — the sig slot opens; scars carry names (wave-68, lanes 68-b / 68-b-r2)
+
+qmr2 made the HASH pluggable and left the sig exactly where qmr1 had it:
+`HMAC-SHA256(secret, "qmr1:sig:"+id)`. HMAC's honest residual, receipted since
+qmr1: a shared secret has NO per-signer identity — every writer holds full
+signing power, so "who signed this row" was fleet-trust, not attribution. v3
+opens the SIG SLOT the same way qmr2 opened the hash slot: a registry of named
+sig schemes, a default preserved byte-for-byte, fail-closed verification — and
+one asymmetric member: **ed25519**.
+
+### 8.1 The additive fields
+
+A row MAY carry two new optional fields; rows without them are qmr1 rows,
+byte-unchanged and never rewritten:
+
+```
+sigAlg   "hmac-sha256" (default when absent — qmr1) | "ed25519"
+sigKeyFp sha256(normalized SPKI PEM of the signer's public key) → 64-hex;
+         REQUIRED on ed25519 rows, FORBIDDEN on hmac rows (E_SIGNER_MALFORMED —
+         a shared secret has no signer identity to name)
+```
+
+For `sigAlg:"ed25519"`: `sig = Ed25519("qmr1:sig:"+id)` — 128-hex — over the
+SAME preimage string the HMAC covers (`"qmr1:sig:"+id`). The id is unchanged,
+so the hash slot and the sig slot stay orthogonal: any qmr2 dialect hash can
+carry either sig scheme.
+
+### 8.2 The fingerprint law (shared with quilt-jev-toolkit organ v3)
+
+```
+fingerprint(keyPem) = sha256( createPublicKey(keyPem).export({type:"spki", format:"pem"}) )
+```
+
+normalized SPKI PEM, trailing newline included, 64 lowercase hex. The law is
+byte-identical to organ v3's `publicKeyFingerprint` (quilt-jev-toolkit
+`src/organ/ed25519.mjs`), which is what makes the cross-repo proof possible:
+ONE identity mints organ checkpoints and receipt-chain rows, and each repo
+verifies the other's artifact under its own law, by name.
+
+### 8.3 The keyring + E_UNKNOWN_SIGNER (fail-closed)
+
+`verify_chain` and `append_receipt` accept an optional
+`keyring: {fingerprint → publicKeyPem}`:
+
+- the keyring is validated BEFORE any row is read: a non-object, a non-64-hex
+  fingerprint, an unparseable PEM, or a MISLABELED entry (the key's real
+  fingerprint ≠ its keyring key) → `E_BAD_KEYRING` — a broken trust root is
+  refused outright, never partially trusted;
+- an ed25519 row whose `sigKeyFp` is not in the keyring → **`E_UNKNOWN_SIGNER`**
+  (no keyring at all is the same refusal: an unverifiable signer is an unknown
+  signer — attribution is fail-closed);
+- a row whose sig does not verify under `keyring[sigKeyFp]` → `E_BAD_SIGNATURE`
+  (forged sig, altered id, or the wrong key under that fingerprint);
+- hmac rows ignore the keyring entirely (the qmr1 law is unchanged).
+
+`append_receipt` enforces the same law at the door: it never accepts a row it
+cannot attribute.
+
+### 8.4 `verify_attribution` — the WHO tool
+
+New tool, advertised only under `--v3` / env `V3=1` (the same versioned-
+capability pattern as qmr2, so the v1 three-tool and qmr2 five-tool contracts
+pinned by the untouched suites hold). It verifies the FULL chain under the
+keyring first (all §8.3 refusals apply), then reports per row:
+
+- ed25519 row → `{seq, sigAlg:"ed25519", sigKeyFp, signedBy:{fingerprint,
+  verified:true, source:"keyring"}}` (or `verified:false, reason:"E_UNKNOWN_SIGNER"`
+  only in the impossible-after-verification case, kept for shape honesty);
+- hmac row → `{seq, sigAlg:"hmac-sha256", sigKeyFp:null, signedBy:{verified:true,
+  note:"shared-secret HMAC — one anonymous writer; the honest residual"}}`.
+
+### 8.5 Error codes added by §8
+
+`E_UNKNOWN_SIGALG` (unregistered sigAlg), `E_SIGNER_MALFORMED` (sigKeyFp on an
+hmac row / not 64-hex), `E_MISSING_FIELD` (ed25519 row without sigKeyFp),
+`E_UNKNOWN_SIGNER` (signer not proven by the keyring), `E_BAD_KEYRING`
+(broken trust root). qmr1's codes are unchanged.
+
+### 8.6 Non-goals (still)
+
+No PKI (issuance/revocation) — a keyring is a per-verify trust root, not a
+certificate layer; no key rotation semantics beyond the keyring holding several
+fingerprints at once; no re-signing or migration of existing rows (qmr1 rows
+are final bytes). The organ-side twin (checkpoint signatures, key ERAS through
+rotation chains, `signCheckpointEd25519`) lives in quilt-jev-toolkit
+REVERSE-ACTUALIZED-SPEC §10 — the fingerprint law is the shared seam.

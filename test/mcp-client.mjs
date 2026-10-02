@@ -13,18 +13,24 @@ import { fileURLToPath } from 'node:url';
 const SERVER = fileURLToPath(new URL('../server.mjs', import.meta.url));
 
 export class McpClient {
-  constructor({ demo = false, qmr2 = false, store = null, env = {} } = {}) {
+  constructor({ demo = false, qmr2 = false, v3 = false, store = null, env = {} } = {}) {
     this.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qmr2-'));
     this.store = store ?? path.join(this.dir, 'store.jsonl');
     this.argv = [SERVER, '--store', this.store, '--quiet-notice'];
     if (demo) this.argv.push('--demo');
     if (qmr2) this.argv.push('--qmr2');
+    if (v3) this.argv.push('--v3');
     this.nextId = 1;
     this.pending = new Map();
     this.buffer = '';
     this.stderr = [];
     this.child = spawn(process.execPath, this.argv, {
-      env: { ...process.env, ...env, QMR2: qmr2 ? '1' : (env.QMR2 ?? '0') },
+      env: {
+        ...process.env,
+        ...env,
+        QMR2: qmr2 ? '1' : (env.QMR2 ?? '0'),
+        V3: v3 ? '1' : (env.V3 ?? '0'),
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child.stdout.setEncoding('utf8');

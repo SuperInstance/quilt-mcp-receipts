@@ -195,3 +195,27 @@ error at the exact row.
    (`receipts/dogfood-67b.jsonl`); next: `registry.jsonl` / `lessons.jsonl`
    rows gain `qmr1` mirrors, and fleet repos vendor `test/conformance.mjs`
    instead of re-proving the tamper battery by hand.
+
+## The door has been knocked on — the first honest producer (fleet-seeds qmr1-bridge)
+
+Insight #3 of the erised-fleet-table playtest said it exactly: *a receipt chain
+with no producer is a door nobody knocks on.* The chain no longer waits.
+[fleet-seeds](https://github.com/SuperInstance/fleet-seeds) now ships
+`tools/qmr1-bridge.mjs` — a stdlib-only writer that seals its real lode ledgers
+(`registry` / `lessons` / `mines`) under this dialect:
+
+- every invocation **re-verifies the whole chain from genesis, ids and HMAC sigs,
+  and refuses to write on any failure** (fail-closed, named error, `at_seq`);
+- one `lode.row` receipt per lode append going forward, appended only — the
+  bridge has no rewrite, delete, or reorder verb;
+- backfilled honestly at round 71: genesis + one `lode.snapshot` receipt per
+  lode ({rows, sha256 of the full lode file}) — the pre-71 rows are covered by
+  snapshot digests, NOT retroactive per-row sealing; per-row receipts start now;
+- its store, `fleet-seeds/ledger/qmr1-store.jsonl` (tip `719123ffc6d8d575…`,
+  count 4 at genesis), verifies **live** under this server's `verify_chain`
+  when handed the bridge's secret — same formulas, same dialect, one fleet law.
+
+Conformance is proven the right way: the bridge's tests re-derive the signer
+from DESIGN.md §2 independently and run the tamper trio against a real store
+(18/18). Secret material stays in fleet-seeds' gitignored `.qmr1-secret` — the
+HMAC residual (sigs verify for secret holders) is receipted in both repos.

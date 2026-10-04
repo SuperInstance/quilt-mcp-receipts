@@ -219,3 +219,14 @@ Conformance is proven the right way: the bridge's tests re-derive the signer
 from DESIGN.md §2 independently and run the tamper trio against a real store
 (18/18). Secret material stays in fleet-seeds' gitignored `.qmr1-secret` — the
 HMAC residual (sigs verify for secret holders) is receipted in both repos.
+
+## Documentation
+
+Wave-69 full-knowledge documentation package (task 69-doc-d) — routes by audience:
+
+- **New agent, zero context** → [docs/ONBOARDING.md](docs/ONBOARDING.md) — identity, verify-it-works commands (all offline), reading order, gotchas, open frontier.
+- **End users** (read/verify/append receipts over MCP) → [docs/USER-GUIDE.md](docs/USER-GUIDE.md) — first success in 5 minutes, everyday tasks (cursor reads, self-audit, commit, attribution, upgrade), troubleshooting table, FAQ.
+- **Developers extending the code** → [docs/DEVELOPER-GUIDE.md](docs/DEVELOPER-GUIDE.md) — code layout, core concepts as the code names them, how to register dialects/sig schemes/tools, vendoring the conformance harness, testing, editor gotchas.
+- **Engineers operating/reviewing** → [docs/ENGINEERING-NOTES.md](docs/ENGINEERING-NOTES.md) — architecture diagram, invariants, failure modes & blast radius, cost envelope, operations, design decisions with tradeoffs.
+- **Executives** → [docs/CTO-BRIEF.md](docs/CTO-BRIEF.md) — value statement, maturity (working, hardening), risks/mitigations, cost profile ($0), strategic options, integration surface.
+- **Index of all deeper knowledge** → [docs/KNOWLEDGE-MAP.md](docs/KNOWLEDGE-MAP.md) — repo map, pre-existing docs, fleet relationships, journal task IDs, receipts of record, search recipes.
